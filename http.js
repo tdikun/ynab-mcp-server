@@ -5,9 +5,13 @@
 //
 // Required environment:
 //   YNAB_API_TOKEN   YNAB personal access token
-//   MCP_AUTH_TOKEN   shared secret; callers send "Authorization: Bearer <it>"
+//   MCP_AUTH_TOKEN   shared secret; callers send "Authorization: Bearer <it>",
+//                    or (claude.ai connectors) sign in with it through the
+//                    single-user OAuth flow in oauth.js
 // Optional:
 //   YNAB_ALLOW_WRITES=1, YNAB_BUDGET_ID, PORT (default 3000)
+//   PUBLIC_BASE_URL  public origin for OAuth metadata; defaults to Railway's
+//                    RAILWAY_PUBLIC_DOMAIN, then http://localhost:PORT
 //
 // The server refuses to start without MCP_AUTH_TOKEN: an open endpoint would
 // hand the YNAB budget to anyone who finds the URL.
@@ -16,6 +20,7 @@ import { createServer } from "node:http";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { createOAuth } from "./oauth.js";
 
 process.env.YNAB_MCP_NO_AUTOSTART = "1";
 const { createYnabServer, createFsJournal, undoJournalPath } = await import("./index.js");
@@ -35,6 +40,12 @@ if (!YNAB_TOKEN) {
   process.exit(1);
 }
 
+const BASE_URL = (
+  process.env.PUBLIC_BASE_URL ||
+  (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${PORT}`)
+).replace(/\/+$/, "");
+const oauth = createOAuth({ secret: AUTH_TOKEN, baseUrl: BASE_URL });
+
 const journal = createFsJournal(undoJournalPath());
 const sessions = new Map(); // sessionId -> { transport, lastSeen }
 
@@ -47,7 +58,8 @@ function isAuthorized(req) {
   const header = req.headers.authorization || "";
   const match = /^Bearer\s+(.+)$/i.exec(header);
   if (!match) return false;
-  return timingSafeEqual(sha256(match[1].trim()), sha256(AUTH_TOKEN));
+  const token = match[1].trim();
+  return timingSafeEqual(sha256(token), sha256(AUTH_TOKEN)) || oauth.isValidAccessToken(token);
 }
 
 function sendJson(res, status, body, headers = {}) {
@@ -93,7 +105,7 @@ async function newSession() {
 
 async function handleMcp(req, res) {
   if (!isAuthorized(req)) {
-    return rpcError(res, 401, "Unauthorized", { "www-authenticate": "Bearer" });
+    return rpcError(res, 401, "Unauthorized", { "www-authenticate": oauth.challengeHeader });
   }
 
   const sessionId = req.headers["mcp-session-id"];
@@ -127,17 +139,20 @@ async function handleMcp(req, res) {
   res.writeHead(405, { allow: "GET, POST, DELETE" }).end();
 }
 
-const httpServer = createServer((req, res) => {
-  const { pathname } = new URL(req.url, "http://localhost");
-  if (pathname === "/healthz") return sendJson(res, 200, { ok: true });
-  if (pathname === "/mcp") {
-    return handleMcp(req, res).catch((err) => {
-      console.error("MCP request failed:", err?.message || err);
-      if (!res.headersSent) rpcError(res, 500, "Internal server error");
-      else res.end();
-    });
-  }
+async function route(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  if (url.pathname === "/healthz") return sendJson(res, 200, { ok: true });
+  if (url.pathname === "/mcp") return handleMcp(req, res);
+  if (await oauth.handle(req, res, url)) return;
   sendJson(res, 404, { error: "not found" });
+}
+
+const httpServer = createServer((req, res) => {
+  route(req, res).catch((err) => {
+    console.error("Request failed:", err?.message || err);
+    if (!res.headersSent) rpcError(res, 500, "Internal server error");
+    else res.end();
+  });
 });
 
 setInterval(() => {

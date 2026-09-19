@@ -7,7 +7,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 
-COPY index.js http.js LICENSE ./
+COPY index.js http.js oauth.js LICENSE ./
 
 USER node
 
