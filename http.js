@@ -5,7 +5,9 @@
 //
 // Required environment:
 //   YNAB_API_TOKEN   YNAB personal access token
-//   MCP_AUTH_TOKEN   shared secret; callers send "Authorization: Bearer <it>"
+//   MCP_AUTH_TOKEN   shared secret; callers send "Authorization: Bearer <it>",
+//                    or, for hosts that cannot set headers (claude.ai
+//                    connectors), use the URL /mcp/<it>
 // Optional:
 //   YNAB_ALLOW_WRITES=1, YNAB_BUDGET_ID, PORT (default 3000)
 //
@@ -43,11 +45,12 @@ function sha256(value) {
 }
 
 // Hash both sides so timingSafeEqual gets equal-length buffers.
-function isAuthorized(req) {
+function isAuthorized(req, pathToken) {
   const header = req.headers.authorization || "";
   const match = /^Bearer\s+(.+)$/i.exec(header);
-  if (!match) return false;
-  return timingSafeEqual(sha256(match[1].trim()), sha256(AUTH_TOKEN));
+  const presented = pathToken || (match ? match[1].trim() : "");
+  if (!presented) return false;
+  return timingSafeEqual(sha256(presented), sha256(AUTH_TOKEN));
 }
 
 function sendJson(res, status, body, headers = {}) {
@@ -91,8 +94,8 @@ async function newSession() {
   return transport;
 }
 
-async function handleMcp(req, res) {
-  if (!isAuthorized(req)) {
+async function handleMcp(req, res, pathToken) {
+  if (!isAuthorized(req, pathToken)) {
     return rpcError(res, 401, "Unauthorized", { "www-authenticate": "Bearer" });
   }
 
@@ -103,6 +106,7 @@ async function handleMcp(req, res) {
     let body;
     try {
       body = await readJsonBody(req);
+      req.rpcMethod = Array.isArray(body) ? body.map((m) => m?.method).join(",") : body?.method;
     } catch {
       return rpcError(res, 400, "Invalid JSON body");
     }
@@ -130,8 +134,15 @@ async function handleMcp(req, res) {
 const httpServer = createServer((req, res) => {
   const { pathname } = new URL(req.url, "http://localhost");
   if (pathname === "/healthz") return sendJson(res, 200, { ok: true });
-  if (pathname === "/mcp") {
-    return handleMcp(req, res).catch((err) => {
+  // /mcp (bearer header) or /mcp/<token> (token in the URL path)
+  const mcpPath = /^\/mcp(?:\/([^/]+))?\/?$/.exec(pathname);
+  // Never log the raw path: it may carry the token.
+  res.on("finish", () => {
+    const shown = pathname.startsWith("/mcp/") ? "/mcp/<redacted>" : pathname.slice(0, 80);
+    console.error(`${req.method} ${shown} ${res.statusCode}${req.rpcMethod ? ` rpc=${req.rpcMethod}` : ""}${req.headers["mcp-session-id"] ? " session" : ""} accept=${req.headers.accept || "-"}`);
+  });
+  if (mcpPath) {
+    return handleMcp(req, res, mcpPath[1] ? decodeURIComponent(mcpPath[1]) : "").catch((err) => {
       console.error("MCP request failed:", err?.message || err);
       if (!res.headersSent) rpcError(res, 500, "Internal server error");
       else res.end();
