@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <code>59 tools with writes enabled</code> &bull;
+  <code>63 tools with writes enabled</code> &bull;
   <code>6 guided prompts</code> &bull;
   <code>undo journal</code> &bull;
   <code>YNAB API v1.85</code> &bull;
@@ -326,7 +326,7 @@ YNAB_API_TOKEN=your-token-here npm run smoke:review-unapproved -- --published
 
 ## Features
 
-**YNAB API v1.86 coverage** with 59 tools when writes are enabled, plus MCP prompts and resources:
+**YNAB API v1.86 coverage** with 63 tools when writes are enabled, plus MCP prompts and resources:
 
 | Resource | Tools | Capabilities |
 |----------|-------|-------------|
@@ -512,6 +512,19 @@ Every transaction write (create, update, bulk update, approve, reassign, delete,
 | `list_undo_history` | List journaled writes, newest first, with undo capability per entry. Reads only the local journal. |
 | `undo_operation` **(write)** | Reverse a journaled write: restore updated fields, delete created transactions, or recreate a deleted one (without its original bank-import linkage). One undo per entry. Requires `confirmed: true`. |
 
+### Categorization Rules
+
+Plain-language rules ("Kids' novels are Home Schooling") that every client of one server shares: a scheduled categorization run, a chat client and an IDE all read and edit the same list. Rules are stored outside YNAB in one JSON file (`YNAB_RULES_PATH`, default `~/.ynab-mcp-rules.json`); each rule carries its source and timestamps, and a change log keeps the last 200 edits with before and after wording. The same list is readable as the resource `ynab://rules`.
+
+| Tool | Description |
+|------|-------------|
+| `get_rules` | Read the rules, optionally filtered by `topic` or `query`; `includeHistory` adds recent changes. Does not call YNAB. |
+| `add_rules` **(write)** | Add one or more rules with a `source`. Duplicate text is skipped, so retries are safe. |
+| `update_rule` **(write)** | Change a rule's text or topic; the old wording stays in the change log. |
+| `remove_rule` **(write)** | Delete a rule. Requires `confirmed: true`. |
+
+On a hosted deploy the default path is inside the container and is lost on every redeploy: mount a persistent volume and point `YNAB_RULES_PATH` at it (see `http.js`).
+
 ---
 
 ## Workflow Safety Notes
@@ -588,6 +601,7 @@ Manual YNAB transfer fixes can replace one side of the pair with a new transacti
 | `YNAB_API_TOKEN_FILE` | No | (none) | Path to a file containing only the token. The file must be 4 KB or smaller. Used only when `YNAB_API_TOKEN` is unset, and can be provided through process env or agent settings. |
 | `YNAB_BUDGET_ID` | No | `last-used` | Default budget ID. If omitted, tools use YNAB's most recently accessed budget. Run `list_budgets` to find IDs. |
 | `YNAB_ALLOW_WRITES` | No | read-only | Set to `1` to register write tools. Any other value keeps the server read-only. |
+| `YNAB_RULES_PATH` | No | `~/.ynab-mcp-rules.json` | File that stores the shared categorization rules. On a hosted deploy, put it on a persistent volume. |
 | `YNAB_OP_PATH` | No | (none) | 1Password secret reference for your API token. Used only if no direct token is configured. Can be provided through process env or agent settings. |
 | `YNAB_DISABLE_AGENT_CONFIG_FALLBACK` | No | `0` | Set to `1` to stop the server from reading `~/.codex/config.toml` and `~/.claude/settings.json`. Intended for tests and tightly controlled runtimes. |
 | `YNAB_RATE_LIMIT_PER_HOUR` | No | `190` | Client-side rate limiter. Set to `0` to disable for controlled tests. |

@@ -499,6 +499,69 @@ function createFsJournal(filePath) {
   };
 }
 
+// --- Categorization rules storage (Node fs implementation) ---
+// Plain-language rules ("Kids' novels are Home Schooling") that every client
+// of this server reads before categorizing and edits when the user corrects a
+// category. Stored outside the budget as one JSON file. On a hosted deploy,
+// point YNAB_RULES_PATH at a persistent volume or the rules reset on redeploy.
+
+const RULES_CHANGE_LOG_MAX_ENTRIES = 200;
+
+function rulesPath() {
+  return process.env.YNAB_RULES_PATH || path.join(userHomeDir(), ".ynab-mcp-rules.json");
+}
+
+function emptyRulesState() {
+  return { version: 1, rules: [], log: [] };
+}
+
+function createFsRulesStore(filePath) {
+  async function read() {
+    let raw;
+    try {
+      raw = readFileSync(filePath, "utf8");
+    } catch (e) {
+      if (e?.code === "ENOENT") return emptyRulesState();
+      throw e;
+    }
+    // A file that exists but does not parse is surfaced, never treated as
+    // empty: the next write would otherwise replace every stored rule.
+    const parsed = JSON.parse(raw);
+    return {
+      version: 1,
+      rules: Array.isArray(parsed?.rules) ? parsed.rules : [],
+      log: Array.isArray(parsed?.log) ? parsed.log : [],
+    };
+  }
+
+  function persist(state) {
+    const tmpPath = `${filePath}.tmp`;
+    writeFileSync(tmpPath, JSON.stringify({
+      version: 1,
+      rules: state.rules,
+      log: state.log.slice(0, RULES_CHANGE_LOG_MAX_ENTRIES),
+    }, null, 2));
+    renameSync(tmpPath, filePath);
+  }
+
+  // Serialize read-modify-write cycles. The lock lives on the store, not the
+  // server instance, because a hosted process builds one server per session
+  // and shares this store between them.
+  let chain = Promise.resolve();
+  function update(mutator) {
+    const next = chain.then(async () => {
+      const state = await read();
+      const result = await mutator(state);
+      persist(state);
+      return result;
+    });
+    chain = next.catch(() => {});
+    return next;
+  }
+
+  return { path: filePath, read, update };
+}
+
 // --- Server factory ---
 // Builds the entire tool/prompt/resource layer around injected credentials,
 // write gating, undo-journal storage, and auth-status runtime info, so the
@@ -513,6 +576,8 @@ function createFsJournal(filePath) {
 //   writesEnabled: boolean — registers write tools when true.
 //   journal: { async read(), async persist(entries) } | null — undo storage;
 //     null disables journaling (list_undo_history/undo_operation degrade).
+//   rules: { async read(), async update(mutator) } | null — categorization rules
+//     storage (see createFsRulesStore); null disables the rules tools.
 //   runtime: { tokenSource, detected_agent, config_fallback_disabled,
 //     sources_checked, values, tokenLookupError, setupGuide } — auth-status
 //     reporting only; all fields optional.
@@ -525,6 +590,7 @@ const {
   defaultBudgetId = undefined,
   writesEnabled: allowWrites = false,
   journal = null,
+  rules: rulesStore = null,
   runtime = {},
   serverInfo = { name: "YNAB Local", version: "5.4.0" },
 } = options;
@@ -1415,6 +1481,7 @@ const SERVER_INSTRUCTIONS = [
   "Write tools appear only when writes are enabled (YNAB_ALLOW_WRITES=1 locally, or write access granted on the YNAB consent screen for the hosted connector). Bulk and destructive tools require confirmed:true after the user explicitly confirms. Never fabricate transaction IDs; take them from tool results. After approvals report newly_approved_count, not approved_count.",
   "An existing split cannot be edited through the API; un-split it in the YNAB register first. Recategorizing does not move budgeted dollars; use update_month_category for that.",
   "Every transaction write is journaled; list_undo_history and undo_operation reverse it. Fuller methodology: resources ynab://guide/methodology, write-safety, audit-patterns, flags-reference.",
+  "Categorization rules: call get_rules before categorizing and follow them. When the user states or corrects a rule, record it with add_rules or update_rule, citing them as the source.",
 ].join("\n");
 
 const server = new McpServer(serverInfo, { instructions: SERVER_INSTRUCTIONS });
@@ -1549,6 +1616,9 @@ const WRITE_TOOL_METADATA = {
   retire_category: { destructiveHint: false, idempotentHint: true },
   prepare_split_for_matching: { destructiveHint: false, idempotentHint: false },
   undo_operation: { destructiveHint: false, idempotentHint: true },
+  add_rules: { destructiveHint: false, idempotentHint: true },
+  update_rule: { destructiveHint: false, idempotentHint: true },
+  remove_rule: { destructiveHint: true, idempotentHint: true },
 };
 
 function writesEnabled() {
@@ -3663,6 +3733,228 @@ registerTool(
     })
 );
 
+// ==================== Categorization rules ====================
+// Plain-language rules shared by every client of this server (a scheduled
+// categorization run, a chat client, an IDE). Stored by the injected rules
+// store, not in YNAB. Writes are gated like YNAB writes and every change is
+// logged with its source and time.
+
+const RULE_TEXT_MAX_CHARS = 1000;
+const RULE_TOPIC_MAX_CHARS = 60;
+const RULE_SOURCE_MAX_CHARS = 200;
+
+function rulesUnavailableResult() {
+  return {
+    content: [{ type: "text", text: "Error: categorization rules storage is not configured in this deployment." }],
+    isError: true,
+  };
+}
+
+function rulesErrorResult(e) {
+  return {
+    content: [{ type: "text", text: `Error: ${sanitizeErrorMessage(e?.message || String(e))}` }],
+    isError: true,
+  };
+}
+
+function normalizeRuleText(text) {
+  return String(text ?? "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeRuleTopic(topic) {
+  const value = normalizeRuleText(topic);
+  return value || null;
+}
+
+function newRuleId(existing) {
+  const taken = new Set(existing.map((r) => r.id));
+  let id;
+  do {
+    id = `r_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+  } while (taken.has(id));
+  return id;
+}
+
+function sortRules(rules) {
+  // Topic-less rules ("General") sort last.
+  return [...rules].sort((a, b) =>
+    Number(!a.topic) - Number(!b.topic)
+    || (a.topic ?? "").localeCompare(b.topic ?? "")
+    || String(a.created_at).localeCompare(String(b.created_at)));
+}
+
+function rulesMatchingFilter(rules, { topic, query } = {}) {
+  const topicNeedle = topic ? normalizeSearchText(topic) : null;
+  const queryNeedle = query ? normalizeSearchText(query) : null;
+  return rules.filter((r) => {
+    if (topicNeedle && normalizeSearchText(r.topic ?? "") !== topicNeedle) return false;
+    if (queryNeedle && !normalizeSearchText(`${r.topic ?? ""} ${r.text}`).includes(queryNeedle)) return false;
+    return true;
+  });
+}
+
+function formatRulesMarkdown(rules) {
+  if (rules.length === 0) return "# Categorization rules\n\nNo rules stored yet.\n";
+  const lines = ["# Categorization rules", ""];
+  let currentTopic;
+  for (const rule of sortRules(rules)) {
+    const topic = rule.topic ?? "General";
+    if (topic !== currentTopic) {
+      if (currentTopic !== undefined) lines.push("");
+      lines.push(`## ${topic}`);
+      currentTopic = topic;
+    }
+    lines.push(`- ${rule.text} (${rule.id})`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function mutateRules(mutator) {
+  return rulesStore.update(mutator);
+}
+
+function logRuleChange(state, entry) {
+  state.log.unshift({ at: new Date().toISOString(), ...entry });
+  state.log = state.log.slice(0, RULES_CHANGE_LOG_MAX_ENTRIES);
+}
+
+const ruleSourceSchema = z.string().min(1).max(RULE_SOURCE_MAX_CHARS)
+  .describe("Who stated this rule and where, e.g. \"Tim in chat, 2026-11-08\". Use the user's words, never a transaction or receipt.");
+
+registerTool(
+  "get_rules",
+  { description: "Read the categorization rules every client of this server shares. Call before categorizing or splitting transactions and follow the rules over your own judgment. Read-only; does not call YNAB. Optional topic (exact, case-insensitive) or query (substring over topic and text) filters; includeHistory adds the newest change-log entries.", inputSchema: {
+    topic: z.string().optional().describe("Only rules with this topic, e.g. \"Costco\""),
+    query: z.string().optional().describe("Case-insensitive substring match over topic and rule text"),
+    includeHistory: z.boolean().optional().describe("Also return the 20 newest change-log entries"),
+  } },
+  async ({ topic, query, includeHistory } = {}) => {
+    if (!rulesStore) return rulesUnavailableResult();
+    try {
+      const state = await rulesStore.read();
+      const rules = sortRules(rulesMatchingFilter(state.rules, { topic, query }));
+      const out = {
+        count: rules.length,
+        total_rules: state.rules.length,
+        topics: [...new Set(state.rules.map((r) => r.topic ?? "General"))].sort(),
+        rules,
+      };
+      if (includeHistory) out.history = state.log.slice(0, 20);
+      return ok(out);
+    } catch (e) {
+      return rulesErrorResult(e);
+    }
+  }
+);
+
+registerTool(
+  "add_rules",
+  { description: "Add one or more categorization rules, each a plain-language sentence the user stated or confirmed (e.g. \"Kids' novels are Home Schooling\"). Never add a rule the user did not state. A rule whose text already exists (case- and whitespace-insensitive) is skipped, so retries are safe. Returns the stored rules with their ids.", inputSchema: {
+    rules: z.array(z.object({
+      text: z.string().min(1).max(RULE_TEXT_MAX_CHARS).describe("The rule as one plain sentence"),
+      topic: z.string().max(RULE_TOPIC_MAX_CHARS).optional().describe("Short grouping label, e.g. \"Amazon\", \"Costco\", \"Medical\""),
+    })).min(1).max(100).describe("Rules to add"),
+    source: ruleSourceSchema,
+  } },
+  async ({ rules, source }) => {
+    if (!rulesStore) return rulesUnavailableResult();
+    try {
+      const result = await mutateRules((state) => {
+        const added = [];
+        const skipped = [];
+        const now = new Date().toISOString();
+        const seen = new Map(state.rules.map((r) => [normalizeRuleText(r.text).toLowerCase(), r]));
+        for (const input of rules) {
+          const text = normalizeRuleText(input.text);
+          if (!text) continue;
+          const key = text.toLowerCase();
+          if (seen.has(key)) {
+            skipped.push({ text, existing_id: seen.get(key).id });
+            continue;
+          }
+          const rule = {
+            id: newRuleId(state.rules),
+            text,
+            topic: normalizeRuleTopic(input.topic),
+            source,
+            created_at: now,
+            updated_at: now,
+          };
+          state.rules.push(rule);
+          seen.set(key, rule);
+          added.push(rule);
+          logRuleChange(state, { action: "add", rule_id: rule.id, source, after: { text: rule.text, topic: rule.topic } });
+        }
+        return { added, skipped, total_rules: state.rules.length };
+      });
+      return ok({ added_count: result.added.length, skipped_duplicates: result.skipped, ...result });
+    } catch (e) {
+      return rulesErrorResult(e);
+    }
+  }
+);
+
+registerTool(
+  "update_rule",
+  { description: "Change the text or topic of one categorization rule (id from get_rules), for example when the user corrects it. The old wording is kept in the change log.", inputSchema: {
+    id: z.string().describe("Rule id from get_rules"),
+    text: z.string().min(1).max(RULE_TEXT_MAX_CHARS).optional().describe("New rule text"),
+    topic: z.string().max(RULE_TOPIC_MAX_CHARS).nullable().optional().describe("New topic; null clears it"),
+    source: ruleSourceSchema,
+  } },
+  async ({ id, text, topic, source }) => {
+    if (!rulesStore) return rulesUnavailableResult();
+    if (text === undefined && topic === undefined) {
+      return rulesErrorResult(new Error("update_rule needs text or topic to change."));
+    }
+    try {
+      const rule = await mutateRules((state) => {
+        const existing = state.rules.find((r) => r.id === id);
+        if (!existing) throw new Error(`No rule with id ${id}. Use get_rules to find rule ids.`);
+        const before = { text: existing.text, topic: existing.topic };
+        if (text !== undefined) {
+          const normalized = normalizeRuleText(text);
+          const clash = state.rules.find((r) => r.id !== id && normalizeRuleText(r.text).toLowerCase() === normalized.toLowerCase());
+          if (clash) throw new Error(`Rule ${clash.id} already has that text; remove one of them instead.`);
+          existing.text = normalized;
+        }
+        if (topic !== undefined) existing.topic = topic === null ? null : normalizeRuleTopic(topic);
+        existing.source = source;
+        existing.updated_at = new Date().toISOString();
+        logRuleChange(state, { action: "update", rule_id: id, source, before, after: { text: existing.text, topic: existing.topic } });
+        return { ...existing };
+      });
+      return ok({ updated: rule });
+    } catch (e) {
+      return rulesErrorResult(e);
+    }
+  }
+);
+
+registerTool(
+  "remove_rule",
+  { description: "Delete one categorization rule (id from get_rules) when the user says it no longer applies. Its last wording stays in the change log. Requires confirmed:true after the user explicitly confirms.", inputSchema: {
+    id: z.string().describe("Rule id from get_rules"),
+    source: ruleSourceSchema,
+    confirmed: z.literal(true).describe("Required. Pass true only after the user explicitly confirms removing this rule."),
+  } },
+  async ({ id, source }) => {
+    if (!rulesStore) return rulesUnavailableResult();
+    try {
+      const removed = await mutateRules((state) => {
+        const index = state.rules.findIndex((r) => r.id === id);
+        if (index === -1) throw new Error(`No rule with id ${id}. Use get_rules to find rule ids.`);
+        const [rule] = state.rules.splice(index, 1);
+        logRuleChange(state, { action: "remove", rule_id: id, source, before: { text: rule.text, topic: rule.topic } });
+        return rule;
+      });
+      return ok({ removed });
+    } catch (e) {
+      return rulesErrorResult(e);
+    }
+  }
+);
+
 // ==================== Category Workflows ====================
 // The YNAB API has no category merge or delete endpoint (its category paths
 // support only GET/POST/PATCH), so these are composite workflows: move the
@@ -4290,6 +4582,15 @@ for (const [slug, description, text] of YNAB_RESOURCES) {
   );
 }
 
+if (rulesStore) {
+  server.registerResource(
+    "ynab-rules",
+    "ynab://rules",
+    { title: "YNAB categorization rules", description: "The shared categorization rules, grouped by topic (same data as get_rules).", mimeType: "text/markdown" },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "text/markdown", text: formatRulesMarkdown((await rulesStore.read()).rules) }] })
+  );
+}
+
 function promptText(text) {
   return () => ({ messages: [{ role: "user", content: { type: "text", text } }] });
 }
@@ -4367,6 +4668,7 @@ return {
     withWriteGateDescription,
     parseToolExecuteInput,
     invokeRegisteredTool,
+    formatRulesMarkdown,
     verifyBulkTransactionUpdates,
     beforeFieldsForUpdate,
     summarizeApprovalChanges,
@@ -4401,6 +4703,7 @@ const defaultInstance = createYnabServer({
   defaultBudgetId: DEFAULT_BUDGET_ID,
   writesEnabled: runtimeConfig.values.YNAB_ALLOW_WRITES?.value === "1",
   journal: IS_CLOUDFLARE_WORKERS ? null : createFsJournal(undoJournalPath()),
+  rules: IS_CLOUDFLARE_WORKERS ? null : createFsRulesStore(rulesPath()),
   runtime: {
     tokenSource: runtimeConfig.tokenSource,
     detected_agent: runtimeConfig.detected_agent,
@@ -4505,6 +4808,8 @@ export {
   ynabRequestsRemaining,
   currentBudgetMonth,
   createFsJournal,
+  createFsRulesStore,
+  rulesPath,
 };
 
 // --- Start ---

@@ -10,6 +10,10 @@
 //                    connectors), use the URL /mcp/<it>
 // Optional:
 //   YNAB_ALLOW_WRITES=1, YNAB_BUDGET_ID, PORT (default 3000)
+//   YNAB_RULES_PATH  categorization rules file. Point it at a persistent
+//                    volume (e.g. /data/ynab-rules.json on a Railway volume
+//                    mounted at /data); the default lives in the container's
+//                    home directory and is lost on every redeploy.
 //
 // The server refuses to start without MCP_AUTH_TOKEN: an open endpoint would
 // hand the YNAB budget to anyone who finds the URL.
@@ -20,7 +24,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 process.env.YNAB_MCP_NO_AUTOSTART = "1";
-const { createYnabServer, createFsJournal, undoJournalPath } = await import("./index.js");
+const { createYnabServer, createFsJournal, undoJournalPath, createFsRulesStore, rulesPath } = await import("./index.js");
 
 const PORT = Number(process.env.PORT) || 3000;
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || "";
@@ -38,6 +42,9 @@ if (!YNAB_TOKEN) {
 }
 
 const journal = createFsJournal(undoJournalPath());
+// One store shared by every session: its write lock serializes rule edits
+// across the per-session server instances.
+const rules = createFsRulesStore(rulesPath());
 const sessions = new Map(); // sessionId -> { transport, lastSeen }
 
 function sha256(value) {
@@ -80,6 +87,7 @@ async function newSession() {
     defaultBudgetId: process.env.YNAB_BUDGET_ID || undefined,
     writesEnabled: process.env.YNAB_ALLOW_WRITES === "1",
     journal,
+    rules,
     runtime: { tokenSource: "env", detected_agent: "hosted-http", values: {}, sources_checked: [] },
     serverInfo: { name: "YNAB Hosted", version: "5.4.0" },
   });
@@ -162,7 +170,7 @@ setInterval(() => {
 }, 5 * 60 * 1000).unref();
 
 httpServer.listen(PORT, "0.0.0.0", () => {
-  console.error(`YNAB MCP (streamable HTTP) listening on :${PORT}/mcp, writes ${process.env.YNAB_ALLOW_WRITES === "1" ? "enabled" : "disabled"}`);
+  console.error(`YNAB MCP (streamable HTTP) listening on :${PORT}/mcp, writes ${process.env.YNAB_ALLOW_WRITES === "1" ? "enabled" : "disabled"}, rules file ${rulesPath()}`);
 });
 
 for (const signal of ["SIGTERM", "SIGINT"]) {
