@@ -1241,3 +1241,120 @@ test("server advertises instructions at initialize", () => {
   assert.match(instructions, /transferToAccountId/);
   assert.match(instructions, /transactionId/);
 });
+
+// ==================== Categorization rules ====================
+
+const { createFsRulesStore, rulesPath } = await import("../index.js");
+const rulesFs = await import("node:fs");
+const rulesOs = await import("node:os");
+const rulesPathMod = await import("node:path");
+
+function tempRulesFile() {
+  const dir = rulesFs.mkdtempSync(rulesPathMod.join(rulesOs.tmpdir(), "ynab-rules-"));
+  return rulesPathMod.join(dir, "rules.json");
+}
+
+function parseResult(result) {
+  assert.notEqual(result.isError, true, result.content?.[0]?.text);
+  return JSON.parse(result.content[0].text);
+}
+
+test("rulesPath honors YNAB_RULES_PATH", () => {
+  const previous = process.env.YNAB_RULES_PATH;
+  process.env.YNAB_RULES_PATH = "/data/ynab-rules.json";
+  assert.equal(rulesPath(), "/data/ynab-rules.json");
+  if (previous === undefined) delete process.env.YNAB_RULES_PATH;
+  else process.env.YNAB_RULES_PATH = previous;
+  assert.match(rulesPath(), /\.ynab-mcp-rules\.json$|ynab-rules\.json$/);
+});
+
+test("rules store: missing file reads empty, corrupt file throws instead of reading empty", async () => {
+  const file = tempRulesFile();
+  const store = createFsRulesStore(file);
+  assert.deepEqual((await store.read()).rules, []);
+  rulesFs.writeFileSync(file, "{not json");
+  await assert.rejects(() => store.read());
+});
+
+test("rules tools: add, dedupe, filter, update, remove, and log with source", async () => {
+  const file = tempRulesFile();
+  const instance = createYnabServer({ hasCredentials: true, writesEnabled: true, journal: null, rules: createFsRulesStore(file) });
+  const call = (name, args) => instance.internals.invokeRegisteredTool(name, args);
+
+  const added = parseResult(await call("add_rules", {
+    rules: [
+      { text: "Kids' novels are  Home Schooling.", topic: "Home Schooling" },
+      { text: "Groceries is literal food only.", topic: "Groceries" },
+    ],
+    source: "Tim in chat, 2026-11-08",
+  }));
+  assert.equal(added.added_count, 2);
+  assert.equal(added.added[0].text, "Kids' novels are Home Schooling.", "whitespace is normalized");
+  assert.equal(added.added[0].source, "Tim in chat, 2026-11-08");
+  assert.match(added.added[0].id, /^r_[0-9a-f]{8}$/);
+
+  const dup = parseResult(await call("add_rules", { rules: [{ text: "groceries is LITERAL food only." }], source: "retry" }));
+  assert.equal(dup.added_count, 0);
+  assert.equal(dup.skipped_duplicates.length, 1);
+
+  const byTopic = parseResult(await call("get_rules", { topic: "groceries" }));
+  assert.equal(byTopic.count, 1);
+  assert.equal(byTopic.total_rules, 2);
+  const byQuery = parseResult(await call("get_rules", { query: "novels" }));
+  assert.equal(byQuery.rules[0].topic, "Home Schooling");
+
+  const id = byQuery.rules[0].id;
+  const updated = parseResult(await call("update_rule", { id, text: "Kids' novels are always Home Schooling.", source: "Tim correction" }));
+  assert.equal(updated.updated.text, "Kids' novels are always Home Schooling.");
+  assert.equal(updated.updated.source, "Tim correction");
+
+  const clash = await call("update_rule", { id, text: "Groceries is literal food only.", source: "x" });
+  assert.equal(clash.isError, true);
+  const missing = await call("update_rule", { id: "r_nope", topic: "X", source: "x" });
+  assert.equal(missing.isError, true);
+  const empty = await call("update_rule", { id, source: "x" });
+  assert.equal(empty.isError, true);
+
+  const removed = parseResult(await call("remove_rule", { id, source: "Tim", confirmed: true }));
+  assert.equal(removed.removed.id, id);
+
+  const after = parseResult(await call("get_rules", { includeHistory: true }));
+  assert.equal(after.total_rules, 1);
+  assert.deepEqual(after.history.map((h) => h.action), ["remove", "update", "add", "add"]);
+  assert.equal(after.history[1].before.text, "Kids' novels are Home Schooling.");
+
+  // The file on disk is the durable copy a second server instance reads.
+  const second = createYnabServer({ hasCredentials: true, writesEnabled: false, journal: null, rules: createFsRulesStore(file) });
+  const fromDisk = parseResult(await second.internals.invokeRegisteredTool("get_rules", {}));
+  assert.equal(fromDisk.total_rules, 1);
+});
+
+test("rules tools: concurrent adds through one store keep every rule", async () => {
+  const store = createFsRulesStore(tempRulesFile());
+  const a = createYnabServer({ hasCredentials: true, writesEnabled: true, journal: null, rules: store });
+  const b = createYnabServer({ hasCredentials: true, writesEnabled: true, journal: null, rules: store });
+  await Promise.all(Array.from({ length: 10 }, (_, i) =>
+    (i % 2 ? a : b).internals.invokeRegisteredTool("add_rules", { rules: [{ text: `Rule ${i}` }], source: "test" })));
+  assert.equal((await store.read()).rules.length, 10);
+});
+
+test("rules tools: writes are gated, reads stay available, and no store degrades cleanly", async () => {
+  const readOnly = createYnabServer({ hasCredentials: true, writesEnabled: false, journal: null, rules: createFsRulesStore(tempRulesFile()) });
+  assert.equal(await readOnly.internals.invokeRegisteredTool("add_rules", { rules: [{ text: "x" }], source: "x" }), null);
+  assert.equal(parseResult(await readOnly.internals.invokeRegisteredTool("get_rules", {})).count, 0);
+
+  const none = createYnabServer({ hasCredentials: true, writesEnabled: true, journal: null, rules: null });
+  const result = await none.internals.invokeRegisteredTool("get_rules", {});
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /not configured/);
+});
+
+test("formatRulesMarkdown groups rules by topic", () => {
+  const instance = createYnabServer({ hasCredentials: false, writesEnabled: false, journal: null });
+  const md = instance.internals.formatRulesMarkdown([
+    { id: "r_2", text: "Wine is Groceries.", topic: "Costco", created_at: "2026-11-02" },
+    { id: "r_1", text: "Split mixed orders.", topic: null, created_at: "2026-11-01" },
+  ]);
+  assert.match(md, /## Costco\n- Wine is Groceries\. \(r_2\)/);
+  assert.ok(md.indexOf("## Costco") < md.indexOf("## General"));
+});
